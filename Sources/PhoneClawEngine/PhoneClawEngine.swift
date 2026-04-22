@@ -116,6 +116,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    /// Vision encoder backend (`"gpu"` / `"cpu"`). `nil` = vision encoder is NOT loaded
+    /// — saves ~300-500 MB for text-only chat on Gemma 3n E4B. Matches
+    /// Google AI Edge Gallery (Android) behavior: text-only sessions pass
+    /// `visionBackend = null` so SigLIP weights + XNNPack cache never enter memory.
+    private let visionBackend: String?
+    /// Audio encoder backend (`"cpu"` recommended). `nil` = audio encoder is NOT loaded
+    /// — saves ~300-600 MB for text-only chat on Gemma 3n E4B. Same rationale as
+    /// `visionBackend`.
+    private let audioBackend: String?
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     // QoS .default matches the background thread that C API callbacks fire on,
@@ -132,9 +141,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    public init(modelPath: URL, backend: String = "cpu") {
+    ///   - visionBackend: Vision encoder backend (`"gpu"` / `"cpu"`) or `nil` to skip
+    ///     loading the vision encoder entirely. Default `nil` — saves significant memory
+    ///     for text-only chat. Set to `"gpu"` for image input (recommended for Gemma 3n).
+    ///   - audioBackend: Audio encoder backend (`"cpu"`) or `nil` to skip loading.
+    ///     Default `nil`. Set to `"cpu"` for audio input (Gemma 3n audio rejects GPU).
+    public init(
+        modelPath: URL,
+        backend: String = "cpu",
+        visionBackend: String? = nil,
+        audioBackend: String? = nil
+    ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.visionBackend = visionBackend
+        self.audioBackend = audioBackend
     }
 
     deinit {
@@ -168,6 +189,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
+        let visionBackendStr = self.visionBackend
+        let audioBackendStr = self.audioBackend
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -191,13 +214,39 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     do {
                         litert_lm_set_min_log_level(0)  // DEBUG: show all GPU/Metal init logs
 
-                        // Keep text generation configurable, but pin vision/audio
-                        // to CPU for Gemma 4 E4B on iPhone. The audio component
-                        // rejects GPU backend constraints and causes engine
-                        // creation to fail before text-only inference can start.
-                        guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, "cpu", "cpu"
-                        ) else {
+                        // Pass NULL (not "cpu") when vision/audio encoders are not
+                        // needed — mirrors Google AI Edge Gallery (Android)
+                        // `EngineConfig(visionBackend = null, audioBackend = null)`
+                        // for text-only chat. Loading unused encoders costs
+                        // ~800 MB-1.3 GB for Gemma 3n E4B (SigLIP + USM + XNNPack caches).
+                        //
+                        // C API: `const char*` with NULL semantics per engine.h:
+                        //   "The vision backend to use, or NULL if not set."
+                        //
+                        // `withCString` guarantees the temporary C buffer lives
+                        // for the duration of the closure — we make the engine
+                        // settings create call inside that scope.
+                        let settings_opt = { () -> OpaquePointer? in
+                            switch (visionBackendStr, audioBackendStr) {
+                            case (nil, nil):
+                                return litert_lm_engine_settings_create(path, backendStr, nil, nil)
+                            case (let v?, nil):
+                                return v.withCString { vPtr in
+                                    litert_lm_engine_settings_create(path, backendStr, vPtr, nil)
+                                }
+                            case (nil, let a?):
+                                return a.withCString { aPtr in
+                                    litert_lm_engine_settings_create(path, backendStr, nil, aPtr)
+                                }
+                            case (let v?, let a?):
+                                return v.withCString { vPtr in
+                                    a.withCString { aPtr in
+                                        litert_lm_engine_settings_create(path, backendStr, vPtr, aPtr)
+                                    }
+                                }
+                            }
+                        }()
+                        guard let settings = settings_opt else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
