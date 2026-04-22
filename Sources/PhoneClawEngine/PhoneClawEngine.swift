@@ -125,6 +125,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// — saves ~300-600 MB for text-only chat on Gemma 3n E4B. Same rationale as
     /// `visionBackend`.
     private let audioBackend: String?
+    /// Max KV-cache slots (tokens). Controls the size of Metal KV buffer pre-allocated
+    /// at `openSession()`. Smaller = less pinned GPU memory, smaller context budget.
+    ///
+    /// Per-model constraints:
+    /// - Gemma 3n E2B/E4B: fixed at `ekv4096` in the .litertlm — **only 4096 works**.
+    ///   Setting below 2048 fails with DYNAMIC_UPDATE_SLICE.
+    /// - Gemma 4 E2B/E4B: compiled with 32K context support — values 2048 / 3072 /
+    ///   4096 all load. 2048 is the sweet spot for iPhone memory.
+    /// - Qwen/DeepSeek/Phi/Gemma3-1B: check the `ekvNNNN` suffix on the model file
+    ///   name for the compile-time ceiling.
+    ///
+    /// Default 4096 for safety — callers should drop to 2048 for Gemma 4 on mobile.
+    private let maxTokens: Int
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     // QoS .default matches the background thread that C API callbacks fire on,
@@ -146,16 +159,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///     for text-only chat. Set to `"gpu"` for image input (recommended for Gemma 3n).
     ///   - audioBackend: Audio encoder backend (`"cpu"`) or `nil` to skip loading.
     ///     Default `nil`. Set to `"cpu"` for audio input (Gemma 3n audio rejects GPU).
+    ///   - maxTokens: Max KV-cache slots (default 4096). Drop to 2048 for Gemma 4 on
+    ///     iPhone to save ~500 MB of pinned GPU memory. See `maxTokens` property
+    ///     doc for per-model constraints.
     public init(
         modelPath: URL,
         backend: String = "cpu",
         visionBackend: String? = nil,
-        audioBackend: String? = nil
+        audioBackend: String? = nil,
+        maxTokens: Int = 4096
     ) {
         self.modelPath = modelPath
         self.backend = backend
         self.visionBackend = visionBackend
         self.audioBackend = audioBackend
+        self.maxTokens = maxTokens
     }
 
     deinit {
@@ -191,6 +209,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let backendStr = self.backend
         let visionBackendStr = self.visionBackend
         let audioBackendStr = self.audioBackend
+        let maxTokensValue = Int32(self.maxTokens)
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -250,10 +269,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
-                        // Gemma-4 requires exactly 4096 max_tokens (<=2048 fails
-                        // DYNAMIC_UPDATE_SLICE). GPU mode also requires 6GB VA
-                        // space (extended-virtual-addressing entitlement).
-                        litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
+                        // KV-cache size. Previously hardcoded at 4096 — the
+                        // comment below describes **Gemma 3n** constraints, not
+                        // **Gemma 4** (the current production model):
+                        //   - Gemma 3n E2B/E4B: .litertlm is compiled with
+                        //     ekv4096. <=2048 fails DYNAMIC_UPDATE_SLICE.
+                        //   - Gemma 4 E2B/E4B: compiled with 32K max context,
+                        //     values 2048 / 3072 / 4096 all load.
+                        // Caller passes the right value via `maxTokens:`.
+                        litert_lm_engine_settings_set_max_num_tokens(settings, maxTokensValue)
 
                         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
                             .appendingPathComponent("litertlm_cache").path
