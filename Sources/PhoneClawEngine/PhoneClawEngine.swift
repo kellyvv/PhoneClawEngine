@@ -138,6 +138,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///
     /// Default 4096 for safety — callers should drop to 2048 for Gemma 4 on mobile.
     private let maxTokens: Int
+    /// Enable runtime benchmark mode (prefill/decode token + throughput stats).
+    /// Populates `lastSessionBenchmarkSnapshot`. Costs some memory for rolling
+    /// stats arrays + log output. Disable in production for small memory savings.
+    /// Default `true` preserves original behavior.
+    private let enableBenchmark: Bool
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     // QoS .default matches the background thread that C API callbacks fire on,
@@ -162,18 +167,22 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///   - maxTokens: Max KV-cache slots (default 4096). Drop to 2048 for Gemma 4 on
     ///     iPhone to save ~500 MB of pinned GPU memory. See `maxTokens` property
     ///     doc for per-model constraints.
+    ///   - enableBenchmark: Enable prefill/decode timing stats (default `true`).
+    ///     Set `false` for production to save memory + log noise.
     public init(
         modelPath: URL,
         backend: String = "cpu",
         visionBackend: String? = nil,
         audioBackend: String? = nil,
-        maxTokens: Int = 4096
+        maxTokens: Int = 4096,
+        enableBenchmark: Bool = true
     ) {
         self.modelPath = modelPath
         self.backend = backend
         self.visionBackend = visionBackend
         self.audioBackend = audioBackend
         self.maxTokens = maxTokens
+        self.enableBenchmark = enableBenchmark
     }
 
     deinit {
@@ -210,6 +219,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let visionBackendStr = self.visionBackend
         let audioBackendStr = self.audioBackend
         let maxTokensValue = Int32(self.maxTokens)
+        let benchmarkEnabled = self.enableBenchmark
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -284,7 +294,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
-                        litert_lm_engine_settings_enable_benchmark(settings)
+                        // Benchmark mode: stores rolling prefill/decode stats in memory.
+                        // Useful for dev (populates `lastSessionBenchmarkSnapshot`), but
+                        // small memory tax + log noise in production.
+                        if benchmarkEnabled {
+                            litert_lm_engine_settings_enable_benchmark(settings)
+                        }
 
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
