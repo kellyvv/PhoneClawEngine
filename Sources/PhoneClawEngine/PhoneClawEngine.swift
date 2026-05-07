@@ -143,6 +143,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// stats arrays + log output. Disable in production for small memory savings.
     /// Default `true` preserves original behavior.
     private let enableBenchmark: Bool
+    /// Enable LiteRT-LM speculative decoding / Gemma 4 MTP when the linked
+    /// native binary exposes the LiteRT-LM 0.11 settings symbol.
+    private let enableSpeculativeDecoding: Bool
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     // QoS .default matches the background thread that C API callbacks fire on,
@@ -152,6 +155,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "PhoneClawEngine", category: "Engine")
     public private(set) var lastSessionBenchmarkSnapshot: SessionBenchmarkSnapshot?
+    private typealias SetEnableSpeculativeDecoding = @convention(c) (OpaquePointer?, CBool) -> Void
 
     // MARK: - Init
 
@@ -169,13 +173,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///     doc for per-model constraints.
     ///   - enableBenchmark: Enable prefill/decode timing stats (default `true`).
     ///     Set `false` for production to save memory + log noise.
+    ///   - enableSpeculativeDecoding: Enable LiteRT-LM speculative decoding /
+    ///     Gemma 4 MTP when supported by the linked native binary.
     public init(
         modelPath: URL,
         backend: String = "cpu",
         visionBackend: String? = nil,
         audioBackend: String? = nil,
         maxTokens: Int = 4096,
-        enableBenchmark: Bool = true
+        enableBenchmark: Bool = true,
+        enableSpeculativeDecoding: Bool = false
     ) {
         self.modelPath = modelPath
         self.backend = backend
@@ -183,6 +190,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         self.audioBackend = audioBackend
         self.maxTokens = maxTokens
         self.enableBenchmark = enableBenchmark
+        self.enableSpeculativeDecoding = enableSpeculativeDecoding
     }
 
     deinit {
@@ -220,6 +228,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let audioBackendStr = self.audioBackend
         let maxTokensValue = Int32(self.maxTokens)
         let benchmarkEnabled = self.enableBenchmark
+        let speculativeDecodingEnabled = self.enableSpeculativeDecoding
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -301,6 +310,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             litert_lm_engine_settings_enable_benchmark(settings)
                         }
 
+                        if speculativeDecodingEnabled {
+                            guard let setEnableSpeculativeDecoding = Self.resolveSetEnableSpeculativeDecoding() else {
+                                litert_lm_engine_settings_delete(settings)
+                                throw LiteRTLMError.engineCreationFailed(
+                                    "LiteRT-LM binary does not expose speculative decoding settings"
+                                )
+                            }
+                            setEnableSpeculativeDecoding(settings, true)
+                        }
+
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
                             throw LiteRTLMError.engineCreationFailed("litert_lm_engine_create returned NULL")
@@ -325,6 +344,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             status = .error(msg)
             throw error
         }
+    }
+
+    private static func resolveSetEnableSpeculativeDecoding() -> SetEnableSpeculativeDecoding? {
+        let symbol = "litert_lm_engine_settings_set_enable_speculative_decoding"
+        guard let pointer = dlsym(UnsafeMutableRawPointer(bitPattern: -2), symbol) else {
+            return nil
+        }
+        return unsafeBitCast(pointer, to: SetEnableSpeculativeDecoding.self)
     }
 
     /// Unload the model to free memory.
